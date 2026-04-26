@@ -1,0 +1,35 @@
+# Keep the build context tiny and prevent secrets from ever reaching the image.
+
+# Secrets — must never be copied
+.env
+.env.*
+config.json
+config.local.json
+
+# Generated artifacts
+github_directory_mapping.json
+firefly_workflows_created.json
+*.tmp
+
+# VCS / dev tooling
+.git
+.gitignore
+.github/
+.vscode/
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Docker / docs / examples (don't bake into the image)
+Dockerfile
+.dockerignore
+README.md
+LICENSE
+*.md

@@ -1,0 +1,10 @@
+{
+  "repos": [
+    "owner/repo"
+  ],
+  "vcs": {
+    "id": "your-vcs-integration-id",
+    "type": "github",
+    "default_branch": "main"
+  }
+}

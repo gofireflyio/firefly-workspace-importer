@@ -1,0 +1,63 @@
+{
+  "repos": [
+    "owner/repo",
+    "owner-or-org"
+  ],
+  "vcs": {
+    "id": "your-vcs-integration-id",
+    "type": "github",
+    "default_branch": "main"
+  },
+  "workspace": {
+    "runner_type": "firefly",
+    "iac_type": "terraform",
+    "terraform_version": "1.5.7",
+    "execution_triggers": ["merge"],
+    "apply_rule": "manual",
+    "variables": [
+      {
+        "key": "EXAMPLE_ENV_VAR",
+        "value": "example-value",
+        "sensitivity": "string",
+        "destination": "env"
+      }
+    ],
+    "consumed_variable_sets": []
+  },
+  "projects": {
+    "create": true,
+    "project_id": null,
+    "main_members": [
+      {
+        "userId": "user-id-1",
+        "role": "admin"
+      }
+    ],
+    "main_variables": [
+      {
+        "key": "ENV",
+        "value": "production",
+        "sensitivity": "string",
+        "destination": "env"
+      }
+    ],
+    "path_members": {
+      "/aws/production": [
+        {
+          "userId": "user-id-1",
+          "role": "admin"
+        }
+      ]
+    },
+    "path_variables": {
+      "/aws/production": [
+        {
+          "key": "AWS_REGION",
+          "value": "us-east-1",
+          "sensitivity": "string",
+          "destination": "env"
+        }
+      ]
+    }
+  }
+}
