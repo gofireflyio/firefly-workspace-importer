@@ -38,7 +38,7 @@
 
 
 # ---- Stage 1: build ---------------------------------------------------------
-FROM python:3.11-slim-bookworm AS build
+FROM python:3.14-slim-bookworm AS build
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
