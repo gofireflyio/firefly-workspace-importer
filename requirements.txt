@@ -4,4 +4,4 @@
 # For maximum supply-chain safety, regenerate with hash pinning:
 #   pip install pip-tools
 #   pip-compile --generate-hashes --output-file requirements.txt requirements.in
-requests==2.32.3
+requests==2.33.1
