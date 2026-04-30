@@ -32,15 +32,18 @@ Out of scope:
 
 ## Handling of credentials
 
-The importer reads three secrets:
+The importer reads only two secrets:
 
 - `FIREFLY_ACCESS_KEY` / `FIREFLY_SECRET_KEY`
-- `GITHUB_TOKEN`
 
 These are loaded from a `.env` file or environment variables and **never**
 written to logs in unredacted form (logs show `abcd...XX` masking). They are
-sent only to `api.firefly.ai` (or your configured `FIREFLY_API_URL`) and
-`api.github.com` over TLS.
+sent only to `api.firefly.ai` (or your configured `FIREFLY_API_URL`) over TLS.
+
+**No long-lived VCS tokens** (GitHub/GitLab/Bitbucket/etc.) ever touch this
+tool. Repository discovery and directory scanning are performed through
+Firefly's VCS proxy endpoints, which use the credentials already attached to
+your Firefly VCS integration server-side.
 
 `.env` is git-ignored and dockerignored. Do not commit it.
 

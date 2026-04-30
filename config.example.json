@@ -1,13 +1,11 @@
 {
-  "repos": [
-    "owner/repo",
-    "owner-or-org"
-  ],
   "vcs": {
-    "id": "your-vcs-integration-id",
-    "type": "github",
-    "default_branch": "main"
+    "integrationId": "your-firefly-vcs-integration-id"
   },
+  "repositories": [
+    "owner/repo-1",
+    "owner/repo-2"
+  ],
   "workspace": {
     "runner_type": "firefly",
     "iac_type": "terraform",

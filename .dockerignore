@@ -7,6 +7,7 @@ config.json
 config.local.json
 
 # Generated artifacts
+firefly_directory_mapping.json
 github_directory_mapping.json
 firefly_workflows_created.json
 *.tmp

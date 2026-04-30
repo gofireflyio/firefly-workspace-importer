@@ -3,19 +3,24 @@
 Firefly Workspace Importer
 ==========================
 
-End-to-end tool to import GitHub repositories containing Terraform code
-into Firefly as workspaces and projects.
+End-to-end tool to import repositories that contain Terraform code into
+Firefly as workspaces and projects, using Firefly's VCS integrations as
+the single source of truth (no GitHub/GitLab/etc. credentials required).
 
 Two-step pipeline (run separately or together):
-  1. Scan GitHub repositories for directories containing `.tf` files and
-     emit a JSON mapping.
-  2. Create one Firefly workspace per leaf directory, optionally mirroring
-     the directory tree as a Firefly project hierarchy.
+  1. `map`    - Use the Firefly API to discover repos and `.tf`-containing
+                directories under a configured VCS integration; write the
+                mapping to a JSON file.
+  2. `create` - Read the mapping JSON, show the user a review tree of what
+                will be created, prompt for confirmation, then create the
+                Firefly workspaces and (optionally) the mirroring project
+                hierarchy.
 
 Subcommands:
-  map     - Scan GitHub and write the directory mapping JSON.
-  create  - Read an existing mapping JSON and create Firefly resources.
-  run     - map + create in one go.
+  integrations - List available Firefly VCS integrations and exit.
+  map          - Scan via the Firefly VCS API and write the mapping JSON.
+  create       - Read an existing mapping JSON and create Firefly resources.
+  run          - map + create in one go.
 
 Configuration:
   Secrets are read from a .env file (default: ./.env).
@@ -35,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote
 
 import requests
 
@@ -44,12 +49,12 @@ import requests
 # ----------------------------------------------------------------------------
 
 DEFAULT_FIREFLY_API_URL = "https://api.firefly.ai"
-DEFAULT_MAPPING_FILE = "github_directory_mapping.json"
+DEFAULT_MAPPING_FILE = "firefly_directory_mapping.json"
 DEFAULT_RESULTS_FILE = "firefly_workflows_created.json"
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_CONFIG_FILE = "config.json"
 
-VALID_VCS_TYPES = {"github", "gitlab", "bitbucket", "codecommit", "azuredevops"}
+VCS_TYPE_BUCKETS = ("github", "gitlab", "bitbucket", "bitbucketdc", "codecommit", "azuredevops")
 VALID_RUNNER_TYPES = {
     "github-actions", "gitlab-pipelines", "bitbucket-pipelines",
     "azure-pipelines", "jenkins", "semaphore", "atlantis",
@@ -60,14 +65,17 @@ VALID_APPLY_RULES = {"manual", "auto"}
 VALID_SENSITIVITIES = {"string", "secret"}
 VALID_DESTINATIONS = {"env", "iac"}
 
+IAC_FILE_EXTENSIONS = (".tf",)
+
 HTTP_RETRY_STATUSES = {429, 500, 502, 503, 504}
 HTTP_MAX_RETRIES = 4
-HTTP_BACKOFF_BASE = 1.5  # seconds; exponential
+HTTP_BACKOFF_BASE = 1.5
 
 EXIT_OK = 0
 EXIT_PARTIAL = 1
 EXIT_CONFIG = 2
 EXIT_AUTH = 3
+EXIT_USER_ABORT = 4
 
 log = logging.getLogger("firefly")
 
@@ -88,6 +96,10 @@ class ApiError(Exception):
     """Raised on non-retryable API failures."""
 
 
+class UserAbort(Exception):
+    """Raised when the user declines the creation prompt."""
+
+
 # ----------------------------------------------------------------------------
 # Config dataclasses
 # ----------------------------------------------------------------------------
@@ -96,15 +108,12 @@ class ApiError(Exception):
 class Secrets:
     firefly_access_key: str
     firefly_secret_key: str
-    github_token: Optional[str]
     firefly_api_url: str = DEFAULT_FIREFLY_API_URL
 
 
 @dataclass
 class VcsConfig:
-    id: str
-    type: str
-    default_branch: str = "main"
+    integration_id: str
 
 
 @dataclass
@@ -130,10 +139,30 @@ class ProjectsConfig:
 
 @dataclass
 class Config:
-    repos: list[str]
+    repositories: list[str]
     vcs: VcsConfig
     workspace: WorkspaceConfig
     projects: ProjectsConfig
+
+
+@dataclass
+class VcsIntegration:
+    """Firefly VCS integration metadata, as returned by /integrations/global/vcs."""
+    id: str
+    name: str
+    type: str
+    is_enabled: bool
+    active: bool
+    sync_status: str
+    last_fetch_success: Optional[str]
+
+
+@dataclass
+class RepoInfo:
+    """Repository metadata as returned by /vcs/{type}/{id}/repos."""
+    full_name: str
+    default_branch: str
+    description: str
 
 
 # ----------------------------------------------------------------------------
@@ -167,7 +196,6 @@ def load_secrets(env_path: Path) -> Secrets:
     access = get("FIREFLY_ACCESS_KEY")
     secret = get("FIREFLY_SECRET_KEY")
     api_url = get("FIREFLY_API_URL", DEFAULT_FIREFLY_API_URL) or DEFAULT_FIREFLY_API_URL
-    github = get("GITHUB_TOKEN") or get("GH_TOKEN")
 
     if not access or not secret:
         raise ConfigError(
@@ -178,7 +206,6 @@ def load_secrets(env_path: Path) -> Secrets:
     return Secrets(
         firefly_access_key=access,
         firefly_secret_key=secret,
-        github_token=github,
         firefly_api_url=api_url.rstrip("/"),
     )
 
@@ -198,18 +225,16 @@ def load_config(config_path: Path) -> Config:
     except json.JSONDecodeError as e:
         raise ConfigError(f"Invalid JSON in {config_path}: {e}") from e
 
-    repos = raw.get("repos") or []
+    repositories = raw.get("repositories") or []
     vcs = raw.get("vcs") or {}
     ws = raw.get("workspace") or {}
     pr = raw.get("projects") or {}
 
-    cfg = Config(
-        repos=list(repos),
-        vcs=VcsConfig(
-            id=vcs.get("id", ""),
-            type=vcs.get("type", ""),
-            default_branch=vcs.get("default_branch", "main"),
-        ),
+    integration_id = vcs.get("integrationId") or vcs.get("integration_id") or ""
+
+    return Config(
+        repositories=list(repositories),
+        vcs=VcsConfig(integration_id=integration_id),
         workspace=WorkspaceConfig(
             runner_type=ws.get("runner_type", "firefly"),
             iac_type=ws.get("iac_type", "terraform"),
@@ -228,50 +253,40 @@ def load_config(config_path: Path) -> Config:
             path_variables=dict(pr.get("path_variables", {})),
         ),
     )
-    return cfg
 
 
-def validate_config(cfg: Config, *, require_repos: bool, require_firefly: bool) -> None:
+def validate_config(cfg: Config) -> None:
     errors: list[str] = []
 
-    if require_repos and not cfg.repos:
-        errors.append("config.repos is empty")
+    if not cfg.vcs.integration_id:
+        errors.append("config.vcs.integrationId is required")
 
-    if require_firefly:
-        if not cfg.vcs.id:
-            errors.append("config.vcs.id is required")
-        if cfg.vcs.type not in VALID_VCS_TYPES:
-            errors.append(
-                f"config.vcs.type must be one of {sorted(VALID_VCS_TYPES)}, "
-                f"got {cfg.vcs.type!r}"
-            )
-        if cfg.workspace.runner_type not in VALID_RUNNER_TYPES:
-            errors.append(
-                f"config.workspace.runner_type must be one of "
-                f"{sorted(VALID_RUNNER_TYPES)}, got {cfg.workspace.runner_type!r}"
-            )
-        if cfg.workspace.apply_rule not in VALID_APPLY_RULES:
-            errors.append(
-                f"config.workspace.apply_rule must be one of "
-                f"{sorted(VALID_APPLY_RULES)}, got {cfg.workspace.apply_rule!r}"
-            )
-        bad_triggers = [t for t in cfg.workspace.execution_triggers if t not in VALID_TRIGGERS]
-        if bad_triggers:
-            errors.append(
-                f"config.workspace.execution_triggers contains invalid values "
-                f"{bad_triggers}; valid: {sorted(VALID_TRIGGERS)}"
-            )
-        for label, vars_list in (
-            ("workspace.variables", cfg.workspace.variables),
-            ("projects.main_variables", cfg.projects.main_variables),
-        ):
-            errors.extend(_validate_variables(label, vars_list))
-        for path, vars_list in cfg.projects.path_variables.items():
-            errors.extend(_validate_variables(f"projects.path_variables[{path!r}]", vars_list))
-        for label, members_list in (("projects.main_members", cfg.projects.main_members),):
-            errors.extend(_validate_members(label, members_list))
-        for path, members_list in cfg.projects.path_members.items():
-            errors.extend(_validate_members(f"projects.path_members[{path!r}]", members_list))
+    if cfg.workspace.runner_type not in VALID_RUNNER_TYPES:
+        errors.append(
+            f"config.workspace.runner_type must be one of "
+            f"{sorted(VALID_RUNNER_TYPES)}, got {cfg.workspace.runner_type!r}"
+        )
+    if cfg.workspace.apply_rule not in VALID_APPLY_RULES:
+        errors.append(
+            f"config.workspace.apply_rule must be one of "
+            f"{sorted(VALID_APPLY_RULES)}, got {cfg.workspace.apply_rule!r}"
+        )
+    bad_triggers = [t for t in cfg.workspace.execution_triggers if t not in VALID_TRIGGERS]
+    if bad_triggers:
+        errors.append(
+            f"config.workspace.execution_triggers contains invalid values "
+            f"{bad_triggers}; valid: {sorted(VALID_TRIGGERS)}"
+        )
+    for label, vars_list in (
+        ("workspace.variables", cfg.workspace.variables),
+        ("projects.main_variables", cfg.projects.main_variables),
+    ):
+        errors.extend(_validate_variables(label, vars_list))
+    for path, vars_list in cfg.projects.path_variables.items():
+        errors.extend(_validate_variables(f"projects.path_variables[{path!r}]", vars_list))
+    errors.extend(_validate_members("projects.main_members", cfg.projects.main_members))
+    for path, members_list in cfg.projects.path_members.items():
+        errors.extend(_validate_members(f"projects.path_members[{path!r}]", members_list))
 
     if errors:
         raise ConfigError("Configuration errors:\n  - " + "\n  - ".join(errors))
@@ -287,14 +302,10 @@ def _validate_variables(label: str, vars_list: list[dict]) -> list[str]:
             errs.append(f"{label}[{i}] missing required 'key' or 'value'")
         sens = v.get("sensitivity", "string")
         if sens not in VALID_SENSITIVITIES:
-            errs.append(
-                f"{label}[{i}].sensitivity must be one of {sorted(VALID_SENSITIVITIES)}"
-            )
+            errs.append(f"{label}[{i}].sensitivity must be one of {sorted(VALID_SENSITIVITIES)}")
         dest = v.get("destination", "env")
         if dest not in VALID_DESTINATIONS:
-            errs.append(
-                f"{label}[{i}].destination must be one of {sorted(VALID_DESTINATIONS)}"
-            )
+            errs.append(f"{label}[{i}].destination must be one of {sorted(VALID_DESTINATIONS)}")
     return errs
 
 
@@ -362,10 +373,8 @@ def request_with_retry(
 
         if resp.status_code in HTTP_RETRY_STATUSES and attempt < max_retries:
             delay = _retry_after(resp) or HTTP_BACKOFF_BASE ** attempt
-            log.debug(
-                "HTTP %s on %s (attempt %d); retry in %.1fs",
-                resp.status_code, url, attempt + 1, delay,
-            )
+            log.debug("HTTP %s on %s (attempt %d); retry in %.1fs",
+                      resp.status_code, url, attempt + 1, delay)
             time.sleep(delay)
             continue
         return resp
@@ -383,129 +392,11 @@ def _retry_after(resp: requests.Response) -> Optional[float]:
 
 
 # ----------------------------------------------------------------------------
-# GitHub client
-# ----------------------------------------------------------------------------
-
-def parse_repo_input(repo_input: str) -> tuple[str, Optional[str], bool]:
-    """Parse "owner", "owner/repo", or full GitHub URL. Returns (owner, repo, is_org)."""
-    s = repo_input.strip()
-    if s.startswith("http"):
-        parts = urlparse(s).path.strip("/").split("/")
-        if len(parts) >= 2:
-            return parts[0], parts[1].removesuffix(".git"), False
-        if len(parts) == 1 and parts[0]:
-            return parts[0], None, True
-        raise ConfigError(f"Cannot parse repo URL: {repo_input!r}")
-    if "/" in s:
-        owner, _, repo = s.partition("/")
-        if owner and repo:
-            return owner, repo, False
-    if s:
-        return s, None, True
-    raise ConfigError(f"Empty repo entry")
-
-
-class GitHubClient:
-    """Minimal GitHub REST client for directory mapping."""
-
-    BASE_URL = "https://api.github.com"
-
-    def __init__(self, token: Optional[str]):
-        self.session = requests.Session()
-        headers = {
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "firefly-workspace-automation",
-        }
-        if token:
-            headers["Authorization"] = f"token {token}"
-        self.session.headers.update(headers)
-        self.authenticated = bool(token)
-
-    def list_org_repos(self, org: str) -> list[str]:
-        repos: list[str] = []
-        page = 1
-        while True:
-            url = f"{self.BASE_URL}/orgs/{org}/repos"
-            resp = self._get(url, params={"page": page, "per_page": 100, "type": "all"})
-            batch = resp.json()
-            if not batch:
-                break
-            for item in batch:
-                repos.append(f"{item['owner']['login']}/{item['name']}")
-            if len(batch) < 100:
-                break
-            page += 1
-        return repos
-
-    def map_repo_directories(
-        self, owner: str, repo: str, branch: Optional[str] = None
-    ) -> dict[str, Any]:
-        """Return a nested dict of directories that contain `.tf` files (and parents)."""
-        if not branch:
-            info = self._get(f"{self.BASE_URL}/repos/{owner}/{repo}").json()
-            branch = info.get("default_branch", "main")
-
-        ref_url = f"{self.BASE_URL}/repos/{owner}/{repo}/git/ref/heads/{branch}"
-        ref_resp = self._get(ref_url, allow_404=True)
-        if ref_resp.status_code == 404:
-            raise ApiError(
-                f"branch {branch!r} not found for {owner}/{repo} "
-                f"(repo missing or no access)"
-            )
-        tree_sha = ref_resp.json()["object"]["sha"]
-
-        tree_url = f"{self.BASE_URL}/repos/{owner}/{repo}/git/trees/{tree_sha}"
-        tree = self._get(tree_url, params={"recursive": "1"}).json()
-        if tree.get("truncated"):
-            log.warning("GitHub tree for %s/%s is truncated; some dirs may be missing",
-                        owner, repo)
-
-        tf_paths = [
-            item["path"] for item in tree.get("tree", [])
-            if item.get("type") == "blob" and item.get("path", "").endswith(".tf")
-        ]
-
-        included: set[str] = set()
-        for path in tf_paths:
-            if path.startswith("."):
-                continue
-            if "/" not in path:
-                continue
-            dir_path = path.rsplit("/", 1)[0]
-            parts = dir_path.split("/")
-            for i in range(len(parts)):
-                included.add("/".join(parts[: i + 1]))
-
-        mapping: dict[str, Any] = {}
-        for dir_path in sorted(included):
-            if dir_path.startswith("."):
-                continue
-            cursor = mapping
-            for part in dir_path.split("/"):
-                cursor = cursor.setdefault(part, {})
-        return mapping
-
-    def _get(self, url: str, *, params: Optional[dict] = None, allow_404: bool = False) -> requests.Response:
-        self._respect_rate_limit()
-        resp = request_with_retry(self.session, "GET", url, params=params, timeout=30)
-        if allow_404 and resp.status_code == 404:
-            return resp
-        if not resp.ok:
-            raise ApiError(f"GitHub {resp.status_code} on {url}: {resp.text[:200]}")
-        return resp
-
-    def _respect_rate_limit(self) -> None:
-        # If the previous response left us at 0 remaining, sleep until reset.
-        # We piggy-back on session-stored last-response by checking after each call.
-        pass  # Implemented by inspecting headers after each call below if needed.
-
-
-# ----------------------------------------------------------------------------
-# Firefly client
+# Firefly client (Firefly API + VCS proxy endpoints)
 # ----------------------------------------------------------------------------
 
 class FireflyClient:
-    """Firefly v2 API client."""
+    """Firefly v2 API client. Handles auth, projects, workspaces, and VCS proxy."""
 
     def __init__(self, secrets: Secrets):
         self.base_url = secrets.firefly_api_url
@@ -543,12 +434,76 @@ class FireflyClient:
         self._token = token
         self.session.headers["Authorization"] = f"Bearer {token}"
 
+    # --- VCS proxy ---
+
+    def list_vcs_integrations(self) -> list[VcsIntegration]:
+        """GET /v2/api/integrations/global/vcs — flat list across all type buckets."""
+        url = f"{self.base_url}/v2/api/integrations/global/vcs"
+        resp = request_with_retry(self.session, "GET", url, timeout=30)
+        if not resp.ok:
+            raise ApiError(f"list integrations failed (HTTP {resp.status_code}): {resp.text[:200]}")
+        data = resp.json()
+        out: list[VcsIntegration] = []
+        for bucket_name in VCS_TYPE_BUCKETS:
+            for item in data.get(bucket_name, []) or []:
+                out.append(VcsIntegration(
+                    id=item.get("id", ""),
+                    name=item.get("name", ""),
+                    type=item.get("type", bucket_name),
+                    is_enabled=bool(item.get("isEnabled", False)),
+                    active=bool(item.get("active", False)),
+                    sync_status=item.get("syncStatus", ""),
+                    last_fetch_success=item.get("lastFetchSuccess"),
+                ))
+        return out
+
+    def list_repositories(self, vcs_type: str, integration_id: str) -> list[RepoInfo]:
+        """GET /v2/api/vcs/{type}/{id}/repos — private repositories accessible via the integration.
+
+        Restricted to private repos via `onlyPrivateRepos=true` because public repos
+        in a customer's integration are typically forks or upstream contributions, not
+        the customer's own IaC.
+        """
+        url = f"{self.base_url}/v2/api/vcs/{vcs_type}/{integration_id}/repos"
+        resp = request_with_retry(
+            self.session, "GET", url,
+            params={"onlyPrivateRepos": "true"},
+            timeout=60,
+        )
+        if not resp.ok:
+            raise ApiError(f"list repos failed (HTTP {resp.status_code}): {resp.text[:200]}")
+        return [
+            RepoInfo(
+                full_name=item.get("fullName", ""),
+                default_branch=item.get("defaultBranch", ""),
+                description=item.get("description", "") or "",
+            )
+            for item in (resp.json() or [])
+        ]
+
+    def get_directory_tree(
+        self, vcs_type: str, integration_id: str, repo: str, branch: str,
+    ) -> dict[str, Any]:
+        """GET /v2/api/vcs/{type}/{id}/directory-tree — recursive file tree for one repo."""
+        url = f"{self.base_url}/v2/api/vcs/{vcs_type}/{integration_id}/directory-tree"
+        params = {
+            "repo": repo,
+            "branch": branch,
+            "includeFiles": "true",  # required: client-side filters for .tf
+        }
+        resp = request_with_retry(self.session, "GET", url, params=params, timeout=120)
+        if not resp.ok:
+            raise ApiError(
+                f"directory-tree {repo}@{branch} failed (HTTP {resp.status_code}): "
+                f"{resp.text[:200]}"
+            )
+        return resp.json()
+
     # --- Projects ---
 
-    def get_projects_tree(self, search_query: Optional[str] = None) -> dict[str, Any]:
+    def get_projects_tree(self) -> dict[str, Any]:
         url = f"{self.base_url}/v2/runners/projects/tree"
-        params = {"searchQuery": search_query} if search_query else None
-        resp = request_with_retry(self.session, "GET", url, params=params, timeout=30)
+        resp = request_with_retry(self.session, "GET", url, timeout=30)
         if not resp.ok:
             raise ApiError(f"projects/tree failed (HTTP {resp.status_code}): {resp.text[:200]}")
         return resp.json()
@@ -585,11 +540,7 @@ class FireflyClient:
             self.session, "POST", url, data=json.dumps(body), timeout=60,
         )
         if not resp.ok:
-            return {
-                "success": False,
-                "status_code": resp.status_code,
-                "error": resp.text[:500],
-            }
+            return {"success": False, "status_code": resp.status_code, "error": resp.text[:500]}
         try:
             data = resp.json() if resp.content else {}
         except ValueError:
@@ -598,8 +549,47 @@ class FireflyClient:
 
 
 # ----------------------------------------------------------------------------
-# Path / mapping helpers
+# Tree helpers — convert directory-tree response to the importer's mapping
 # ----------------------------------------------------------------------------
+
+def tree_to_iac_mapping(tree: dict[str, Any]) -> dict[str, Any]:
+    """
+    Walk a directory-tree response and return a nested dict containing only
+    directories that have at least one IaC file (transitively).
+
+    The response shape is recursive nodes: {name, path, type, children}.
+    """
+    iac_dirs: set[str] = set()
+
+    def walk(node: dict[str, Any]) -> bool:
+        """Return True if this subtree contains any IaC files."""
+        if node.get("type") == "file":
+            name = node.get("name", "")
+            return name.endswith(IAC_FILE_EXTENSIONS) and not name.startswith(".")
+
+        has_iac = False
+        for child in node.get("children", []) or []:
+            if walk(child):
+                has_iac = True
+        if has_iac:
+            path = node.get("path", "")
+            if path and not _path_starts_with_dot(path):
+                iac_dirs.add(path)
+        return has_iac
+
+    walk(tree)
+
+    mapping: dict[str, Any] = {}
+    for path in sorted(iac_dirs):
+        cursor = mapping
+        for part in path.split("/"):
+            cursor = cursor.setdefault(part, {})
+    return mapping
+
+
+def _path_starts_with_dot(path: str) -> bool:
+    return any(part.startswith(".") for part in path.split("/"))
+
 
 def get_leaf_directories(structure: dict[str, Any], base: str = "") -> list[str]:
     """Return paths of leaf directories (no children) from a nested mapping."""
@@ -613,12 +603,21 @@ def get_leaf_directories(structure: dict[str, Any], base: str = "") -> list[str]
     return leaves
 
 
+def count_all_directories(structure: dict[str, Any]) -> int:
+    """Total number of directory nodes (every level, not just leaves)."""
+    count = 0
+    for value in structure.values():
+        if isinstance(value, dict):
+            count += 1
+            count += count_all_directories(value)
+    return count
+
+
 def format_work_dir(work_dir: str) -> str:
     return work_dir if work_dir.startswith("/") else f"/{work_dir}"
 
 
 def sanitize_project_name(name: str) -> str:
-    """Project names: alphanumeric + - and _; no spaces or slashes."""
     cleaned = name.replace(" ", "-").replace("/", "-")
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
@@ -643,13 +642,11 @@ def find_project_by_name(tree: dict[str, Any], name: str) -> Optional[dict[str, 
                 if hit:
                     return hit
         return None
-
     return walk(tree.get("data") or [])
 
 
 def find_root_projects(tree: dict[str, Any]) -> list[dict[str, Any]]:
     roots: list[dict[str, Any]] = []
-
     def walk(items: list[dict[str, Any]]) -> None:
         for item in items:
             if "id" in item and not item.get("parentId"):
@@ -658,13 +655,11 @@ def find_root_projects(tree: dict[str, Any]) -> list[dict[str, Any]]:
                 walk(item["children"])
             if isinstance(item.get("data"), list):
                 walk(item["data"])
-
     walk(tree.get("data") or [])
     return roots
 
 
 def project_id_for_work_dir(work_dir: str, project_map: dict[str, str]) -> Optional[str]:
-    """Exact match first, else longest matching parent path."""
     formatted = format_work_dir(work_dir.lstrip("/"))
     if formatted in project_map:
         return project_map[formatted]
@@ -676,6 +671,142 @@ def project_id_for_work_dir(work_dir: str, project_map: dict[str, str]) -> Optio
         if formatted.startswith(path) and len(path) > best_len:
             best_id, best_len = pid, len(path)
     return best_id
+
+
+# ----------------------------------------------------------------------------
+# Integration resolution and review prompt
+# ----------------------------------------------------------------------------
+
+def resolve_integration(
+    firefly: FireflyClient, integration_id: str,
+) -> VcsIntegration:
+    """Look up the integration by ID; raise ConfigError with a helpful list on miss."""
+    integrations = firefly.list_vcs_integrations()
+    for integ in integrations:
+        if integ.id == integration_id:
+            if not integ.is_enabled or not integ.active:
+                raise ConfigError(
+                    f"VCS integration '{integ.name}' ({integ.id}) is disabled or inactive."
+                )
+            if integ.sync_status and integ.sync_status != "synced":
+                log.warning(
+                    "VCS integration '%s' has syncStatus=%s (last successful fetch: %s). "
+                    "Directory listings may be stale.",
+                    integ.name, integ.sync_status, integ.last_fetch_success or "unknown",
+                )
+            return integ
+    raise ConfigError(
+        f"VCS integration {integration_id!r} not found among "
+        f"{len(integrations)} integration(s). "
+        f"Run `integrations` subcommand to see available IDs."
+    )
+
+
+def select_repositories(
+    available: list[RepoInfo],
+    requested: list[str],
+    *,
+    ignore_missing: bool,
+) -> list[RepoInfo]:
+    """Filter `available` to `requested`. Strict by default."""
+    if not requested:
+        return available
+
+    by_name = {r.full_name: r for r in available}
+    selected: list[RepoInfo] = []
+    missing: list[str] = []
+    for name in requested:
+        if name in by_name:
+            selected.append(by_name[name])
+        else:
+            missing.append(name)
+
+    if missing:
+        msg = (
+            f"{len(missing)} requested repo(s) not found in this integration: "
+            f"{', '.join(missing)}"
+        )
+        if ignore_missing:
+            log.warning(msg)
+        else:
+            raise ConfigError(
+                msg + ". Re-run with --ignore-missing-repos to skip them, "
+                "or use the `integrations` subcommand to list valid repos."
+            )
+    return selected
+
+
+def render_review_tree(
+    repo_plans: list[tuple[str, str, list[str], int]],
+    *,
+    create_projects: bool,
+) -> str:
+    """
+    Render the review tree.
+
+    repo_plans: list of (full_name, default_branch, leaf_dirs, project_count)
+    """
+    out: list[str] = []
+    out.append("=" * 70)
+    out.append("Review — workspaces and projects to be created in Firefly")
+    out.append("=" * 70)
+    out.append("")
+
+    total_workspaces = 0
+    total_projects = 0
+    for full_name, branch, leaves, projects in repo_plans:
+        if not leaves:
+            out.append(f"  {full_name} (branch: {branch})")
+            out.append(f"    (no Terraform directories found — will be skipped)")
+            out.append("")
+            continue
+        out.append(f"  {full_name} (branch: {branch})")
+        for i, leaf in enumerate(leaves):
+            connector = "└─" if i == len(leaves) - 1 else "├─"
+            out.append(f"    {connector} {format_work_dir(leaf)}")
+        out.append("")
+        total_workspaces += len(leaves)
+        total_projects += projects
+
+    out.append("-" * 70)
+    out.append("Summary")
+    out.append(f"  {total_workspaces} workspace(s)")
+    if create_projects:
+        out.append(f"  {total_projects} project(s) (mirroring directory structure, "
+                   f"includes 1 main per repo)")
+    else:
+        out.append("  No projects will be created (projects.create=false)")
+    out.append("=" * 70)
+    return "\n".join(out)
+
+
+def confirm_creation(*, dry_run: bool, yes: bool) -> bool:
+    """Prompt the user to confirm. Returns False if declined or non-TTY without --yes.
+
+    Writes prompts to stderr so output ordering survives stdout redirection.
+    """
+    if dry_run:
+        print("\nDry-run mode — skipping confirmation prompt; nothing will be created.",
+              file=sys.stderr)
+        return True
+    if yes:
+        print("\n--yes provided — proceeding without confirmation.", file=sys.stderr)
+        return True
+    if not sys.stdin.isatty():
+        print(
+            "\nERROR: stdin is not a TTY and --yes was not provided.\n"
+            "       Re-run with --yes to bypass the confirmation prompt.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        sys.stderr.write("\nProceed with creation? [y/N]: ")
+        sys.stderr.flush()
+        answer = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        return False
+    return answer in ("y", "yes")
 
 
 # ----------------------------------------------------------------------------
@@ -695,7 +826,6 @@ class Results:
 class Orchestrator:
     def __init__(
         self,
-        github: GitHubClient,
         firefly: FireflyClient,
         config: Config,
         *,
@@ -703,7 +833,6 @@ class Orchestrator:
         results_path: Path,
         workers: int,
     ):
-        self.github = github
         self.firefly = firefly
         self.config = config
         self.dry_run = dry_run
@@ -712,61 +841,105 @@ class Orchestrator:
 
     # --- map ---
 
-    def build_mapping(self) -> dict[str, Any]:
+    def build_mapping(self, *, ignore_missing_repos: bool) -> dict[str, Any]:
+        """Discover repos and Terraform directories via the Firefly VCS API."""
+        integration = resolve_integration(self.firefly, self.config.vcs.integration_id)
+        log.info("Using VCS integration '%s' (%s, %s)",
+                 integration.name, integration.id, integration.type)
+
+        log.info("Listing repositories under integration...")
+        all_repos = self.firefly.list_repositories(integration.type, integration.id)
+        log.info("  %d repo(s) accessible via this integration", len(all_repos))
+
+        repos = select_repositories(
+            all_repos, self.config.repositories, ignore_missing=ignore_missing_repos,
+        )
+        if self.config.repositories:
+            log.info("  filtered to %d requested repo(s)", len(repos))
+
+        if self.workers == 1 or len(repos) == 1:
+            scan_results = [self._scan_repo(integration, r) for r in repos]
+        else:
+            log.info("  scanning with %d worker(s) in parallel", self.workers)
+            with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                futures = {ex.submit(self._scan_repo, integration, r): r for r in repos}
+                scan_results = [f.result() for f in as_completed(futures)]
+
+        # Stable order by repo full name
+        scan_results.sort(key=lambda x: x[0])
+
         mapping: dict[str, Any] = {}
-        for entry in self.config.repos:
-            owner, repo, is_org = parse_repo_input(entry)
-            if is_org:
-                log.info("Listing repos for organization %s", owner)
-                try:
-                    repo_list = self.github.list_org_repos(owner)
-                except ApiError as e:
-                    log.error("Skipping org %s: %s", owner, e)
-                    mapping[f"{owner}/*"] = {"error": str(e)}
-                    continue
-                log.info("Found %d repos in %s", len(repo_list), owner)
-                for full in repo_list:
-                    o, r = full.split("/", 1)
-                    mapping[full] = self._safe_map(o, r)
-            else:
-                assert repo is not None
-                mapping[f"{owner}/{repo}"] = self._safe_map(owner, repo)
+        for full_name, repo_meta in scan_results:
+            mapping[full_name] = repo_meta
         return mapping
 
-    def _safe_map(self, owner: str, repo: str) -> dict[str, Any]:
-        log.info("Mapping %s/%s", owner, repo)
+    def _scan_repo(
+        self, integration: VcsIntegration, repo: RepoInfo,
+    ) -> tuple[str, dict[str, Any]]:
+        log.info("Scanning %s @ %s", repo.full_name, repo.default_branch)
         try:
-            result = self.github.map_repo_directories(owner, repo)
-            log.info("  %s/%s: %d directories", owner, repo, _count_dirs(result))
-            return result
+            tree = self.firefly.get_directory_tree(
+                integration.type, integration.id, repo.full_name, repo.default_branch,
+            )
+            iac_tree = tree_to_iac_mapping(tree)
+            leaves = len(get_leaf_directories(iac_tree))
+            log.info("  %s: %d Terraform leaf dir(s)", repo.full_name, leaves)
+            return repo.full_name, {
+                "defaultBranch": repo.default_branch,
+                "description": repo.description,
+                "tree": iac_tree,
+            }
         except ApiError as e:
-            log.error("  %s/%s failed: %s", owner, repo, e)
-            return {"error": str(e)}
+            log.error("  %s: scan failed: %s", repo.full_name, e)
+            return repo.full_name, {
+                "defaultBranch": repo.default_branch,
+                "description": repo.description,
+                "tree": {},
+                "error": str(e),
+            }
 
     # --- create ---
 
-    def create_all(self, mapping: dict[str, Any]) -> Results:
+    def create_all(self, mapping: dict[str, Any], *, yes: bool) -> Results:
         results = Results(total_repos=len(mapping))
 
-        for repo, structure in mapping.items():
-            log.info("Repository: %s", repo)
-            if not isinstance(structure, dict) or "error" in structure:
-                log.warning("  Skipping %s (mapping error: %s)",
-                            repo, structure.get("error") if isinstance(structure, dict) else "invalid")
-                continue
+        repo_plans: list[tuple[str, str, list[str], int]] = []
+        for repo, meta in mapping.items():
+            if not isinstance(meta, dict) or "tree" not in meta:
+                raise ConfigError(
+                    f"Mapping entry for {repo!r} is in an old/unknown format. "
+                    f"Re-run `map` to regenerate {self.results_path.name}'s sibling mapping file."
+                )
+            branch = meta.get("defaultBranch", "")
+            tree = meta.get("tree") or {}
+            leaves = get_leaf_directories(tree)
+            project_count = count_all_directories(tree) + 1  # +1 main project
+            repo_plans.append((repo, branch, leaves, project_count))
 
+        # Always print the review tree (stderr for stable interleaving with logs)
+        print(file=sys.stderr)
+        print(render_review_tree(repo_plans, create_projects=self.config.projects.create),
+              file=sys.stderr)
+
+        if not confirm_creation(dry_run=self.dry_run, yes=yes):
+            raise UserAbort("User declined the creation prompt")
+
+        for repo, branch, leaves, _ in repo_plans:
+            meta = mapping[repo]
+            if "error" in meta:
+                log.warning("Skipping %s: scan error (%s)", repo, meta["error"])
+                continue
+            log.info("Repository: %s", repo)
+
+            tree = meta["tree"]
             project_map: dict[str, str] = {}
             root_project_id: Optional[str] = None
-
             if self.config.projects.create:
-                root_project_id, project_map, created_count = self._build_projects_for_repo(repo, structure)
+                root_project_id, project_map, created_count = self._build_projects_for_repo(repo, tree)
                 results.total_projects_created += created_count
-
             self._apply_path_attachments(project_map)
 
-            leaf_dirs = get_leaf_directories(structure)
-            log.info("  %d leaf directories", len(leaf_dirs))
-            self._create_workspaces_for_repo(repo, leaf_dirs, project_map, results)
+            self._create_workspaces_for_repo(repo, branch, leaves, project_map, results)
 
             if self.config.projects.create:
                 results.projects.append({
@@ -780,15 +953,12 @@ class Orchestrator:
         return results
 
     def _build_projects_for_repo(
-        self, repo: str, structure: dict[str, Any]
+        self, repo: str, structure: dict[str, Any],
     ) -> tuple[Optional[str], dict[str, str], int]:
         created = 0
-
         if self.dry_run:
             log.info("  [dry-run] would build project tree for %s", repo)
-            project_map = {format_work_dir(p): f"<dry-run:{sanitize_project_name(workspace_name_for(repo, p))}>"
-                           for p in _all_paths(structure)}
-            return f"<dry-run:{sanitize_project_name(repo)}>", project_map, 0
+            return f"<dry-run:{sanitize_project_name(repo)}>", {}, 0
 
         existing_tree = self.firefly.get_projects_tree()
         existing_root = find_root_projects(existing_tree)
@@ -853,7 +1023,7 @@ class Orchestrator:
 
             if subdirs and project_id:
                 created += self._build_subtree(
-                    subdirs, repo, current, project_id, existing_tree, project_map
+                    subdirs, repo, current, project_id, existing_tree, project_map,
                 )
         return created
 
@@ -903,6 +1073,7 @@ class Orchestrator:
     def _create_workspaces_for_repo(
         self,
         repo: str,
+        default_branch: str,
         leaf_dirs: list[str],
         project_map: dict[str, str],
         results: Results,
@@ -920,10 +1091,9 @@ class Orchestrator:
                 "runnerType": self.config.workspace.runner_type,
                 "iacType": self.config.workspace.iac_type,
                 "workspaceName": ws_name,
-                "vcsId": self.config.vcs.id,
+                "vcsId": self.config.vcs.integration_id,
                 "repo": repo,
-                "defaultBranch": self.config.vcs.default_branch,
-                "vcsType": self.config.vcs.type,
+                "defaultBranch": default_branch,
                 "workDir": formatted,
                 "variables": self.config.workspace.variables,
                 "execution": {
@@ -945,7 +1115,9 @@ class Orchestrator:
 
         if self.workers == 1:
             for ws_name, formatted, body in bodies:
-                self._submit_one(repo, ws_name, formatted, body, results)
+                log.info("  Creating workspace: %s", ws_name)
+                res = self.firefly.create_workspace(body)
+                self._record_workspace(repo, ws_name, formatted, body, res, results)
                 self._save_results(results)
             return
 
@@ -962,13 +1134,6 @@ class Orchestrator:
                     res = {"success": False, "error": str(e)}
                 self._record_workspace(repo, ws_name, formatted, body, res, results)
                 self._save_results(results)
-
-    def _submit_one(
-        self, repo: str, ws_name: str, formatted: str, body: dict, results: Results,
-    ) -> None:
-        log.info("  Creating workspace: %s", ws_name)
-        res = self.firefly.create_workspace(body)
-        self._record_workspace(repo, ws_name, formatted, body, res, results)
 
     def _record_workspace(
         self,
@@ -987,7 +1152,6 @@ class Orchestrator:
         }
         if body.get("project"):
             info["project_id"] = body["project"]
-
         if res["success"]:
             log.info("    OK %s", ws_name)
             info["workspace_id"] = (res.get("data") or {}).get("id")
@@ -1016,57 +1180,68 @@ class Orchestrator:
         tmp.replace(self.results_path)
 
 
-def _count_dirs(structure: dict[str, Any]) -> int:
-    count = 0
-    for value in structure.values():
-        if isinstance(value, dict):
-            count += 1
-            count += _count_dirs(value)
-    return count
-
-
-def _all_paths(structure: dict[str, Any], base: str = "") -> list[str]:
-    out: list[str] = []
-    for name, sub in structure.items():
-        path = f"{base}/{name}" if base else name
-        out.append(path)
-        if isinstance(sub, dict) and sub:
-            out.extend(_all_paths(sub, path))
-    return out
-
-
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    # Common flags live on a parent parser so they work whether passed BEFORE
+    # the subcommand (`cmd --dry-run run`) or AFTER it (`cmd run --dry-run`).
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--env-file", default=DEFAULT_ENV_FILE,
+                        help=f"Path to .env file with secrets (default: {DEFAULT_ENV_FILE})")
+    common.add_argument("--config", default=DEFAULT_CONFIG_FILE,
+                        help=f"Path to JSON config file (default: {DEFAULT_CONFIG_FILE})")
+    common.add_argument("--mapping-file", default=DEFAULT_MAPPING_FILE,
+                        help=f"Path to mapping JSON (default: {DEFAULT_MAPPING_FILE})")
+    common.add_argument("--results-file", default=DEFAULT_RESULTS_FILE,
+                        help=f"Path to results JSON (default: {DEFAULT_RESULTS_FILE})")
+    common.add_argument("--workers", type=int, default=1,
+                        help="Concurrent scan/create operations (default: 1, serial)")
+    common.add_argument("--dry-run", action="store_true",
+                        help="Do not call write APIs; show what would happen")
+    common.add_argument("--yes", "-y", action="store_true",
+                        help="Skip the interactive review prompt before creation")
+    common.add_argument("--ignore-missing-repos", action="store_true",
+                        help="Warn instead of erroring when config.repositories lists "
+                             "names not found in the integration")
+    common.add_argument("-v", "--verbose", action="count", default=1,
+                        help="Increase verbosity (-v info [default], -vv debug)")
+    common.add_argument("-q", "--quiet", action="store_true",
+                        help="Only warnings and errors")
+
     p = argparse.ArgumentParser(
         prog="firefly-workspace-importer.py",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[common],
     )
-    p.add_argument("--env-file", default=DEFAULT_ENV_FILE,
-                   help=f"Path to .env file with secrets (default: {DEFAULT_ENV_FILE})")
-    p.add_argument("--config", default=DEFAULT_CONFIG_FILE,
-                   help=f"Path to JSON config file (default: {DEFAULT_CONFIG_FILE})")
-    p.add_argument("--mapping-file", default=DEFAULT_MAPPING_FILE,
-                   help=f"Path to mapping JSON (default: {DEFAULT_MAPPING_FILE})")
-    p.add_argument("--results-file", default=DEFAULT_RESULTS_FILE,
-                   help=f"Path to results JSON (default: {DEFAULT_RESULTS_FILE})")
-    p.add_argument("--workers", type=int, default=1,
-                   help="Concurrent workspace creations (default: 1, serial)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Do not call write APIs; show what would happen")
-    p.add_argument("-v", "--verbose", action="count", default=1,
-                   help="Increase verbosity (-v info [default], -vv debug)")
-    p.add_argument("-q", "--quiet", action="store_true",
-                   help="Only warnings and errors")
 
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("map", help="Scan GitHub repos and write mapping JSON")
-    sub.add_parser("create", help="Read mapping JSON and create Firefly resources")
-    sub.add_parser("run", help="map + create end-to-end")
+    sub.add_parser("integrations", parents=[common],
+                   help="List Firefly VCS integrations and exit")
+    sub.add_parser("map", parents=[common],
+                   help="Scan via Firefly VCS API and write mapping JSON")
+    sub.add_parser("create", parents=[common],
+                   help="Read mapping JSON and create Firefly resources")
+    sub.add_parser("run", parents=[common],
+                   help="map + create end-to-end")
     return p
+
+
+def cmd_integrations(firefly: FireflyClient) -> int:
+    integrations = firefly.list_vcs_integrations()
+    if not integrations:
+        print("No VCS integrations configured in Firefly.")
+        return EXIT_OK
+    print(f"{'ID':<26}  {'TYPE':<12}  {'NAME':<40}  {'SYNC':<10}  LAST FETCH SUCCESS")
+    for integ in integrations:
+        marker = " " if integ.is_enabled and integ.active else "*"
+        last = (integ.last_fetch_success or "").replace("T", " ").split(".")[0]
+        print(f"{integ.id:<26}  {integ.type:<12}  {integ.name[:40]:<40}  "
+              f"{integ.sync_status:<10}  {last}{marker}")
+    print("\n* = disabled or inactive")
+    return EXIT_OK
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -1080,57 +1255,60 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     try:
         secrets = load_secrets(env_path)
-        config = load_config(config_path)
     except ConfigError as e:
         log.error("%s", e)
         return EXIT_CONFIG
 
     log.info("Firefly API: %s", secrets.firefly_api_url)
     log.info("Firefly access key: %s", mask(secrets.firefly_access_key))
-    log.info("GitHub token: %s", mask(secrets.github_token) if secrets.github_token else "<unset, public-only>")
     if args.dry_run:
         log.warning("DRY-RUN: no write APIs will be called")
 
     try:
+        # `integrations` is a quick read-only command — no config needed beyond secrets
+        if args.command == "integrations":
+            firefly = FireflyClient(secrets)
+            firefly.login()
+            return cmd_integrations(firefly)
+
+        config = load_config(config_path)
+        validate_config(config)
+
+        firefly = FireflyClient(secrets)
+        # `create --dry-run` only reads the local mapping and prints a plan,
+        # so we can skip auth. `map` and `run` need real API access either way.
+        needs_login = not (args.dry_run and args.command == "create")
+        if needs_login:
+            firefly.login()
+        orch = Orchestrator(
+            firefly, config,
+            dry_run=args.dry_run, results_path=results_path, workers=args.workers,
+        )
+
         if args.command == "map":
-            validate_config(config, require_repos=True, require_firefly=False)
-            github = GitHubClient(secrets.github_token)
-            mapping = Orchestrator(github, _NoopFirefly(), config,
-                                   dry_run=args.dry_run, results_path=results_path,
-                                   workers=args.workers).build_mapping()
-            mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+            mapping = orch.build_mapping(ignore_missing_repos=args.ignore_missing_repos)
+            mapping_path.write_text(
+                json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8",
+            )
             log.warning("Wrote mapping to %s", mapping_path)
             return EXIT_OK
 
         if args.command == "create":
-            validate_config(config, require_repos=False, require_firefly=True)
             if not mapping_path.exists():
                 log.error("Mapping file not found: %s. Run `map` first.", mapping_path)
                 return EXIT_CONFIG
             mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
-            firefly = FireflyClient(secrets)
-            if not args.dry_run:
-                firefly.login()
-            orch = Orchestrator(GitHubClient(secrets.github_token), firefly, config,
-                                dry_run=args.dry_run, results_path=results_path,
-                                workers=args.workers)
-            results = orch.create_all(mapping)
+            results = orch.create_all(mapping, yes=args.yes)
             _print_summary(results)
             return EXIT_OK if results.total_workflows_failed == 0 else EXIT_PARTIAL
 
         if args.command == "run":
-            validate_config(config, require_repos=True, require_firefly=True)
-            github = GitHubClient(secrets.github_token)
-            firefly = FireflyClient(secrets)
-            if not args.dry_run:
-                firefly.login()
-            orch = Orchestrator(github, firefly, config,
-                                dry_run=args.dry_run, results_path=results_path,
-                                workers=args.workers)
-            mapping = orch.build_mapping()
-            mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+            mapping = orch.build_mapping(ignore_missing_repos=args.ignore_missing_repos)
+            mapping_path.write_text(
+                json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8",
+            )
             log.warning("Wrote mapping to %s", mapping_path)
-            results = orch.create_all(mapping)
+            results = orch.create_all(mapping, yes=args.yes)
             _print_summary(results)
             return EXIT_OK if results.total_workflows_failed == 0 else EXIT_PARTIAL
 
@@ -1140,9 +1318,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     except AuthError as e:
         log.error("%s", e)
         return EXIT_AUTH
+    except UserAbort as e:
+        log.warning("Aborted: %s", e)
+        return EXIT_USER_ABORT
     except KeyboardInterrupt:
         log.error("Interrupted")
-        return EXIT_PARTIAL
+        return EXIT_USER_ABORT
 
     return EXIT_OK
 
@@ -1153,13 +1334,6 @@ def _print_summary(results: Results) -> None:
                 results.total_workflows_created,
                 results.total_workflows_failed,
                 results.total_projects_created)
-
-
-class _NoopFirefly:
-    """Placeholder used by `map` so the orchestrator type-checks without a real client."""
-
-    def __getattr__(self, name: str) -> Any:
-        raise RuntimeError(f"Firefly client not initialized (called {name})")
 
 
 if __name__ == "__main__":
