@@ -187,10 +187,11 @@ By default, listing a repo that doesn't exist in the integration is an error
 | Key | Default | Description |
 | --- | --- | --- |
 | `runner_type` | `firefly` | One of `github-actions`, `gitlab-pipelines`, `bitbucket-pipelines`, `azure-pipelines`, `jenkins`, `semaphore`, `atlantis`, `env0`, `firefly`, `unrecognized` |
-| `iac_type` | `terraform` | IaC type |
-| `terraform_version` | `1.5.7` | Pinned TF version |
+| `iac_type` | `opentofu` | IaC type. The directory scan filters for `.tf` files (used by both Terraform and OpenTofu); other IaC types are not currently supported. |
+| `terraform_version` | `1.11.6` | Pinned IaC tool version. Field name reflects Firefly's API (`terraformVersion`); the value applies to OpenTofu when `iac_type=opentofu`. |
 | `execution_triggers` | `["merge"]` | Subset of `merge`, `push`, `pull_request` |
 | `apply_rule` | `manual` | `manual` or `auto` |
+| `is_remote` | `true` | Whether the workspace's Terraform state is managed by Firefly (remote state). Maps to API field `isRemote`. Set `false` if you keep state in S3/GCS/etc. and just want Firefly to read it. |
 | `variables` | `[]` | Workspace variables (see schema below) |
 | `consumed_variable_sets` | `[]` | Variable set IDs to attach |
 
@@ -210,16 +211,25 @@ and `projects.path_variables`):
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `create` | `true` | Mirror the directory tree as a project hierarchy |
-| `project_id` | `null` | If `create=false`, attach all workspaces to this single project ID |
-| `main_members` | `[]` | Members for the per-repo root project (each `{userId, role}`) |
-| `main_variables` | `[]` | Variables for the per-repo root project |
-| `path_members` | `{}` | Map of `/path/in/repo` → list of members |
-| `path_variables` | `{}` | Map of `/path/in/repo` → list of variables |
+| `create` | `false` | Whether to create Firefly project(s). When `false`, no projects are created (workspaces are unscoped). |
+| `nested` | `false` | Only meaningful when `create=true`. When `true`, mirrors the entire directory tree as a project hierarchy (one project per directory level). When `false`, only one main project per repo is created and all of that repo's workspaces are attached to it. |
+| `project_id` | `null` | When `create=false`, attach all workspaces to this single project ID. |
+| `main_members` | `[]` | Members for the per-repo main project (each `{userId, role}`) |
+| `main_variables` | `[]` | Variables for the per-repo main project |
+| `path_members` | `{}` | Map of `/path/in/repo` → list of members. Requires `nested=true` (otherwise sub-projects don't exist to attach to; the importer logs a warning at startup). |
+| `path_variables` | `{}` | Map of `/path/in/repo` → list of variables. Requires `nested=true`. |
 
-##### What gets created
+##### Three modes
 
-Given `repositories: ["acme/infra"]` and a repo with this structure:
+| Mode | Config | What gets created |
+| --- | --- | --- |
+| **No projects** (default) | `{}` or `{"create": false}` | Workspaces only, no Firefly project structure |
+| **Main project per repo** | `{"create": true, "nested": false}` | One main project per repo; every workspace in that repo is attached to it |
+| **Full directory mirror** | `{"create": true, "nested": true}` | Main project + sub-project per directory level; workspaces attached to the deepest matching sub-project |
+
+##### What gets created — main-only mode (`create=true, nested=false`)
+
+Given `repositories: ["acme/infra"]` with this directory structure:
 
 ```
 acme/infra/
@@ -230,7 +240,20 @@ acme/infra/
     └── dev/main.tf
 ```
 
-…the importer creates this in Firefly:
+…you get one project and three workspaces under it:
+
+```
+acme-infra                            ← main project [main_members + main_variables]
+
+Workspaces (all attached to acme-infra):
+  acme/infra/aws/production
+  acme/infra/aws/staging
+  acme/infra/gcp/dev
+```
+
+##### What gets created — nested mode (`create=true, nested=true`)
+
+Same input, but a deeper project tree:
 
 ```
 acme-infra                            ← main project          [main_members + main_variables]
@@ -246,10 +269,15 @@ Workspaces:
   acme/infra/gcp/dev         → attached to acme-infra-gcp-dev
 ```
 
-##### `path_*` matching rules
+Use this only when you actually need path-scoped members/variables. The full
+mirror creates many more projects, increasing the chance of name conflicts on
+re-runs.
 
-The keys of `path_members` and `path_variables` are matched against the
-work-dir paths in the mapping. Mismatches are logged and skipped, not fatal.
+##### `path_*` matching rules (nested mode only)
+
+`path_members` and `path_variables` only do anything in nested mode (since
+sub-projects don't exist otherwise). The keys are matched against the work-dir
+paths in the mapping. Mismatches are logged and skipped, not fatal.
 
 | Key | Result |
 | --- | --- |

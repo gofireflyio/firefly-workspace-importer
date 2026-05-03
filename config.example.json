@@ -8,10 +8,11 @@
   ],
   "workspace": {
     "runner_type": "firefly",
-    "iac_type": "terraform",
-    "terraform_version": "1.5.7",
+    "iac_type": "opentofu",
+    "terraform_version": "1.11.6",
     "execution_triggers": ["merge"],
     "apply_rule": "manual",
+    "is_remote": true,
     "variables": [
       {
         "key": "EXAMPLE_ENV_VAR",
@@ -24,6 +25,7 @@
   },
   "projects": {
     "create": true,
+    "nested": false,
     "project_id": null,
     "main_members": [
       {

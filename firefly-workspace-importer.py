@@ -119,17 +119,19 @@ class VcsConfig:
 @dataclass
 class WorkspaceConfig:
     runner_type: str = "firefly"
-    iac_type: str = "terraform"
-    terraform_version: str = "1.5.7"
+    iac_type: str = "opentofu"
+    terraform_version: str = "1.11.6"  # also used for opentofu (Firefly API field is `terraformVersion`)
     execution_triggers: list[str] = field(default_factory=lambda: ["merge"])
     apply_rule: str = "manual"
+    is_remote: bool = True  # remote state — API field `isRemote`
     variables: list[dict] = field(default_factory=list)
     consumed_variable_sets: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ProjectsConfig:
-    create: bool = True
+    create: bool = False  # default: no projects (workspaces only)
+    nested: bool = False  # only meaningful when create=True; True = full directory mirror
     project_id: Optional[str] = None
     main_members: list[dict] = field(default_factory=list)
     main_variables: list[dict] = field(default_factory=list)
@@ -237,15 +239,17 @@ def load_config(config_path: Path) -> Config:
         vcs=VcsConfig(integration_id=integration_id),
         workspace=WorkspaceConfig(
             runner_type=ws.get("runner_type", "firefly"),
-            iac_type=ws.get("iac_type", "terraform"),
-            terraform_version=ws.get("terraform_version", "1.5.7"),
+            iac_type=ws.get("iac_type", "opentofu"),
+            terraform_version=ws.get("terraform_version", "1.11.6"),
             execution_triggers=list(ws.get("execution_triggers", ["merge"])),
             apply_rule=ws.get("apply_rule", "manual"),
+            is_remote=bool(ws.get("is_remote", True)),
             variables=list(ws.get("variables", [])),
             consumed_variable_sets=list(ws.get("consumed_variable_sets", [])),
         ),
         projects=ProjectsConfig(
-            create=bool(pr.get("create", True)),
+            create=bool(pr.get("create", False)),
+            nested=bool(pr.get("nested", False)),
             project_id=pr.get("project_id"),
             main_members=list(pr.get("main_members", [])),
             main_variables=list(pr.get("main_variables", [])),
@@ -290,6 +294,15 @@ def validate_config(cfg: Config) -> None:
 
     if errors:
         raise ConfigError("Configuration errors:\n  - " + "\n  - ".join(errors))
+
+    # Soft warnings — config is valid but a setting won't take effect
+    if cfg.projects.create and not cfg.projects.nested:
+        if cfg.projects.path_members or cfg.projects.path_variables:
+            log.warning(
+                "config.projects.path_members and path_variables are set but will "
+                "be IGNORED because projects.nested=false (no sub-projects to "
+                "attach them to). Set projects.nested=true to enable them."
+            )
 
 
 def _validate_variables(label: str, vars_list: list[dict]) -> list[str]:
@@ -613,6 +626,28 @@ def count_all_directories(structure: dict[str, Any]) -> int:
     return count
 
 
+def get_all_directory_paths(structure: dict[str, Any], base: str = "") -> list[str]:
+    """All directory paths (every level, not just leaves), depth-first."""
+    paths: list[str] = []
+    for name, sub in structure.items():
+        path = f"{base}/{name}" if base else name
+        paths.append(path)
+        if isinstance(sub, dict) and sub:
+            paths.extend(get_all_directory_paths(sub, path))
+    return paths
+
+
+def project_names_for_repo(repo: str, tree: dict[str, Any], *, nested: bool) -> list[str]:
+    """Project names the importer would create for this repo (main first)."""
+    names = [sanitize_project_name(repo)]
+    if nested:
+        names.extend(
+            sanitize_project_name(workspace_name_for(repo, p))
+            for p in get_all_directory_paths(tree)
+        )
+    return names
+
+
 def format_work_dir(work_dir: str) -> str:
     return work_dir if work_dir.startswith("/") else f"/{work_dir}"
 
@@ -737,14 +772,14 @@ def select_repositories(
 
 
 def render_review_tree(
-    repo_plans: list[tuple[str, str, list[str], int]],
+    repo_plans: list[tuple[str, str, list[str], list[str]]],
     *,
-    create_projects: bool,
+    config: Config,
 ) -> str:
     """
     Render the review tree.
 
-    repo_plans: list of (full_name, default_branch, leaf_dirs, project_count)
+    repo_plans: list of (full_name, default_branch, leaf_dirs, project_names)
     """
     out: list[str] = []
     out.append("=" * 70)
@@ -752,9 +787,57 @@ def render_review_tree(
     out.append("=" * 70)
     out.append("")
 
+    # --- Configuration that will be applied to every workspace ---
+    out.append("Workspace configuration:")
+    out.append(f"  Runner:              {config.workspace.runner_type}")
+    out.append(f"  IaC:                 {config.workspace.iac_type} {config.workspace.terraform_version}")
+    out.append(f"  Triggers:            {', '.join(config.workspace.execution_triggers) or '(none)'}")
+    out.append(f"  Apply rule:          {config.workspace.apply_rule}")
+    out.append(f"  Remote state:        {'on (Firefly-managed)' if config.workspace.is_remote else 'off (workspace manages its own state)'}")
+
+    n_vars = len(config.workspace.variables)
+    if n_vars:
+        n_secret = sum(1 for v in config.workspace.variables if v.get("sensitivity") == "secret")
+        suffix = f" ({n_secret} secret)" if n_secret else ""
+        out.append(f"  Workspace variables: {n_vars}{suffix}")
+    n_sets = len(config.workspace.consumed_variable_sets)
+    if n_sets:
+        out.append(f"  Variable sets:       {n_sets}")
+
+    if not config.projects.create:
+        mode = "no projects (workspaces unscoped)"
+        if config.projects.project_id:
+            mode = f"all workspaces attached to project {config.projects.project_id}"
+    elif config.projects.nested:
+        mode = "full directory tree mirror"
+    else:
+        mode = "one main project per repo"
+    out.append(f"  Project mode:        {mode}")
+
+    if config.projects.create:
+        n_mm = len(config.projects.main_members)
+        n_mv = len(config.projects.main_variables)
+        if n_mm or n_mv:
+            parts = []
+            if n_mm:
+                parts.append(f"{n_mm} member(s)")
+            if n_mv:
+                parts.append(f"{n_mv} variable(s)")
+            out.append(f"  Main project attach: {', '.join(parts)}")
+        if config.projects.nested:
+            n_pm = len(config.projects.path_members)
+            n_pv = len(config.projects.path_variables)
+            if n_pm or n_pv:
+                out.append(f"  Path-specific:       "
+                           f"{n_pm} path(s) with members, {n_pv} path(s) with variables")
+    out.append("")
+    out.append("-" * 70)
+    out.append("Repositories:")
+    out.append("")
+
     total_workspaces = 0
     total_projects = 0
-    for full_name, branch, leaves, projects in repo_plans:
+    for full_name, branch, leaves, project_names in repo_plans:
         if not leaves:
             out.append(f"  {full_name} (branch: {branch})")
             out.append(f"    (no Terraform directories found — will be skipped)")
@@ -766,16 +849,34 @@ def render_review_tree(
             out.append(f"    {connector} {format_work_dir(leaf)}")
         out.append("")
         total_workspaces += len(leaves)
-        total_projects += projects
+        total_projects += len(project_names)
 
     out.append("-" * 70)
     out.append("Summary")
     out.append(f"  {total_workspaces} workspace(s)")
-    if create_projects:
-        out.append(f"  {total_projects} project(s) (mirroring directory structure, "
-                   f"includes 1 main per repo)")
+    if config.projects.create:
+        if config.projects.nested:
+            out.append(f"  {total_projects} project(s) — main + sub-project per directory level")
+        else:
+            out.append(f"  {total_projects} project(s) — one main project per repo")
     else:
         out.append("  No projects will be created (projects.create=false)")
+
+    if config.projects.create and total_projects > 0:
+        out.append("")
+        out.append("  Projects to create:")
+        for _, _, leaves, project_names in repo_plans:
+            if not leaves:  # repos with no leaves are skipped → no projects either
+                continue
+            for name in project_names:
+                out.append(f"    New --> {name}")
+
+    if total_workspaces > 0:
+        out.append("")
+        out.append("  Workspaces to create:")
+        for full_name, _, leaves, _ in repo_plans:
+            for leaf in leaves:
+                out.append(f"    New --> {workspace_name_for(full_name, leaf)}")
     out.append("=" * 70)
     return "\n".join(out)
 
@@ -816,9 +917,12 @@ def confirm_creation(*, dry_run: bool, yes: bool) -> bool:
 @dataclass
 class Results:
     total_repos: int = 0
+    total_repos_skipped: int = 0  # skipped due to unrecoverable project conflict
     total_workflows_created: int = 0
     total_workflows_failed: int = 0
+    total_workflows_skipped: int = 0  # already-exists, treated as idempotent success
     total_projects_created: int = 0
+    total_projects_failed: int = 0
     workflows: list[dict] = field(default_factory=list)
     projects: list[dict] = field(default_factory=list)
 
@@ -885,6 +989,7 @@ class Orchestrator:
             leaves = len(get_leaf_directories(iac_tree))
             log.info("  %s: %d Terraform leaf dir(s)", repo.full_name, leaves)
             return repo.full_name, {
+                "vcsType": integration.type,
                 "defaultBranch": repo.default_branch,
                 "description": repo.description,
                 "tree": iac_tree,
@@ -892,6 +997,7 @@ class Orchestrator:
         except ApiError as e:
             log.error("  %s: scan failed: %s", repo.full_name, e)
             return repo.full_name, {
+                "vcsType": integration.type,
                 "defaultBranch": repo.default_branch,
                 "description": repo.description,
                 "tree": {},
@@ -903,7 +1009,7 @@ class Orchestrator:
     def create_all(self, mapping: dict[str, Any], *, yes: bool) -> Results:
         results = Results(total_repos=len(mapping))
 
-        repo_plans: list[tuple[str, str, list[str], int]] = []
+        repo_plans: list[tuple[str, str, list[str], list[str]]] = []
         for repo, meta in mapping.items():
             if not isinstance(meta, dict) or "tree" not in meta:
                 raise ConfigError(
@@ -913,13 +1019,15 @@ class Orchestrator:
             branch = meta.get("defaultBranch", "")
             tree = meta.get("tree") or {}
             leaves = get_leaf_directories(tree)
-            project_count = count_all_directories(tree) + 1  # +1 main project
-            repo_plans.append((repo, branch, leaves, project_count))
+            if self.config.projects.create:
+                projects = project_names_for_repo(repo, tree, nested=self.config.projects.nested)
+            else:
+                projects = []
+            repo_plans.append((repo, branch, leaves, projects))
 
         # Always print the review tree (stderr for stable interleaving with logs)
         print(file=sys.stderr)
-        print(render_review_tree(repo_plans, create_projects=self.config.projects.create),
-              file=sys.stderr)
+        print(render_review_tree(repo_plans, config=self.config), file=sys.stderr)
 
         if not confirm_creation(dry_run=self.dry_run, yes=yes):
             raise UserAbort("User declined the creation prompt")
@@ -928,18 +1036,43 @@ class Orchestrator:
             meta = mapping[repo]
             if "error" in meta:
                 log.warning("Skipping %s: scan error (%s)", repo, meta["error"])
+                results.total_repos_skipped += 1
                 continue
+            if not leaves:
+                log.info("Skipping %s: no Terraform directories found", repo)
+                results.total_repos_skipped += 1
+                continue
+            vcs_type = meta.get("vcsType")
+            if not vcs_type:
+                raise ConfigError(
+                    f"Mapping entry for {repo!r} is missing 'vcsType'. "
+                    f"This means the mapping file was produced by an older version "
+                    f"of the importer. Re-run `map` (or `run`) to regenerate it."
+                )
             log.info("Repository: %s", repo)
 
             tree = meta["tree"]
             project_map: dict[str, str] = {}
             root_project_id: Optional[str] = None
             if self.config.projects.create:
-                root_project_id, project_map, created_count = self._build_projects_for_repo(repo, tree)
+                root_project_id, project_map, created_count, failed_count, skip_repo = \
+                    self._build_projects_for_repo(repo, tree)
                 results.total_projects_created += created_count
-            self._apply_path_attachments(project_map)
+                results.total_projects_failed += failed_count
+                if skip_repo:
+                    log.warning(
+                        "  Skipping all workspaces for %s — main project conflict is "
+                        "unrecoverable. See instructions above.", repo,
+                    )
+                    results.total_repos_skipped += 1
+                    self._save_results(results)
+                    continue
+                if self.config.projects.nested:
+                    self._apply_path_attachments(project_map)
 
-            self._create_workspaces_for_repo(repo, branch, leaves, project_map, results)
+            self._create_workspaces_for_repo(
+                repo, vcs_type, branch, leaves, project_map, root_project_id, results,
+            )
 
             if self.config.projects.create:
                 results.projects.append({
@@ -954,11 +1087,18 @@ class Orchestrator:
 
     def _build_projects_for_repo(
         self, repo: str, structure: dict[str, Any],
-    ) -> tuple[Optional[str], dict[str, str], int]:
+    ) -> tuple[Optional[str], dict[str, str], int, int, bool]:
+        """Returns (root_project_id, project_map, created_count, failed_count, skip_repo).
+
+        skip_repo=True signals the caller to skip workspace creation for this repo
+        because main-project setup did not complete (and orphan workspaces are worse
+        than no workspaces).
+        """
         created = 0
+        failed = 0
         if self.dry_run:
             log.info("  [dry-run] would build project tree for %s", repo)
-            return f"<dry-run:{sanitize_project_name(repo)}>", {}, 0
+            return f"<dry-run:{sanitize_project_name(repo)}>", {}, 0, 0, False
 
         existing_tree = self.firefly.get_projects_tree()
         existing_root = find_root_projects(existing_tree)
@@ -978,14 +1118,31 @@ class Orchestrator:
             )
             if not res["success"]:
                 log.error("    Failed: %s", res.get("error"))
-                return existing_root_id, {}, 0
+                failed += 1
+                if _looks_like_already_exists(res):
+                    log.error(
+                        "    Project '%s' exists in Firefly (likely from a previous "
+                        "run) but cannot be located via the API for re-use.",
+                        repo_project_name,
+                    )
+                    log.error(
+                        "    To re-run cleanly: delete this project in the Firefly "
+                        "Projects UI, then re-run the importer.",
+                    )
+                return None, {}, 0, failed, True
+
             root_project_id = res["data"].get("id")
             created += 1
             self._apply_main_attachments(root_project_id)
 
         project_map: dict[str, str] = {}
-        created += self._build_subtree(structure, repo, "", root_project_id, existing_tree, project_map)
-        return root_project_id, project_map, created
+        if self.config.projects.nested:
+            sub_created, sub_failed = self._build_subtree(
+                structure, repo, "", root_project_id, existing_tree, project_map,
+            )
+            created += sub_created
+            failed += sub_failed
+        return root_project_id, project_map, created, failed, False
 
     def _build_subtree(
         self,
@@ -995,8 +1152,10 @@ class Orchestrator:
         parent_id: Optional[str],
         existing_tree: dict[str, Any],
         project_map: dict[str, str],
-    ) -> int:
+    ) -> tuple[int, int]:
+        """Returns (created_count, failed_count)."""
         created = 0
+        failed = 0
         for dir_name, subdirs in structure.items():
             current = f"{base_path}/{dir_name}" if base_path else dir_name
             formatted = format_work_dir(current)
@@ -1016,16 +1175,19 @@ class Orchestrator:
                 )
                 if not res["success"]:
                     log.error("      Failed: %s", res.get("error"))
+                    failed += 1
                     continue
                 project_id = res["data"].get("id")
                 project_map[formatted] = project_id
                 created += 1
 
             if subdirs and project_id:
-                created += self._build_subtree(
+                sub_created, sub_failed = self._build_subtree(
                     subdirs, repo, current, project_id, existing_tree, project_map,
                 )
-        return created
+                created += sub_created
+                failed += sub_failed
+        return created, failed
 
     def _apply_main_attachments(self, project_id: Optional[str]) -> None:
         if not project_id:
@@ -1073,28 +1235,39 @@ class Orchestrator:
     def _create_workspaces_for_repo(
         self,
         repo: str,
+        vcs_type: str,
         default_branch: str,
         leaf_dirs: list[str],
         project_map: dict[str, str],
+        root_project_id: Optional[str],
         results: Results,
     ) -> None:
         bodies: list[tuple[str, str, dict]] = []
         for work_dir in leaf_dirs:
             formatted = format_work_dir(work_dir)
             ws_name = workspace_name_for(repo, work_dir)
-            project_id = (
-                project_id_for_work_dir(formatted, project_map)
-                if self.config.projects.create else None
-            ) or self.config.projects.project_id
+            # Lookup chain (first non-None wins):
+            #   1. nested sub-project matching this work_dir (if projects.nested=True)
+            #   2. main project for this repo (when projects.create=True)
+            #   3. global projects.project_id (when projects.create=False)
+            if self.config.projects.create:
+                project_id = (
+                    project_id_for_work_dir(formatted, project_map)
+                    or root_project_id
+                )
+            else:
+                project_id = self.config.projects.project_id
 
             body: dict[str, Any] = {
                 "runnerType": self.config.workspace.runner_type,
                 "iacType": self.config.workspace.iac_type,
                 "workspaceName": ws_name,
                 "vcsId": self.config.vcs.integration_id,
+                "vcsType": vcs_type,
                 "repo": repo,
                 "defaultBranch": default_branch,
                 "workDir": formatted,
+                "isRemote": self.config.workspace.is_remote,
                 "variables": self.config.workspace.variables,
                 "execution": {
                     "triggers": self.config.workspace.execution_triggers,
@@ -1157,6 +1330,12 @@ class Orchestrator:
             info["workspace_id"] = (res.get("data") or {}).get("id")
             info["status_code"] = res.get("status_code")
             results.total_workflows_created += 1
+        elif _looks_like_workspace_already_exists(res):
+            log.info("    SKIP %s (already exists)", ws_name)
+            info["status"] = "already_exists"
+            info["status_code"] = res.get("status_code")
+            info["success"] = True  # idempotent — treat as success in the results file
+            results.total_workflows_skipped += 1
         else:
             log.error("    FAIL %s: %s", ws_name, res.get("error"))
             info["error"] = res.get("error")
@@ -1169,9 +1348,12 @@ class Orchestrator:
             return
         payload = {
             "total_repos": results.total_repos,
+            "total_repos_skipped": results.total_repos_skipped,
             "total_workflows_created": results.total_workflows_created,
             "total_workflows_failed": results.total_workflows_failed,
+            "total_workflows_skipped": results.total_workflows_skipped,
             "total_projects_created": results.total_projects_created,
+            "total_projects_failed": results.total_projects_failed,
             "workflows": results.workflows,
             "projects": results.projects,
         }
@@ -1180,13 +1362,63 @@ class Orchestrator:
         tmp.replace(self.results_path)
 
 
+def _looks_like_already_exists(res: dict) -> bool:
+    """Detect 'project already exists' from a create_project failure response."""
+    if res.get("status_code") != 409:
+        return False
+    err = (res.get("error") or "").lower()
+    return "already exists" in err
+
+
+def _looks_like_workspace_already_exists(res: dict) -> bool:
+    """Detect 'workspace already exists' from a create_workspace failure response."""
+    if res.get("status_code") != 409:
+        return False
+    err = (res.get("error") or "").lower()
+    return "workspace already exists" in err or "already exists" in err
+
+
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 
+KNOWN_SUBCOMMANDS = {"integrations", "map", "create", "run"}
+VALUE_FLAGS = {"--env-file", "--config", "--mapping-file", "--results-file", "--workers"}
+
+
+def _reorder_argv_for_subcommand(argv: list[str]) -> list[str]:
+    """Move global flags from before the subcommand to AFTER it.
+
+    Argparse's `parents=` mechanism has a known footgun: when the same flag is
+    defined on both the main parser and a subparser, the subparser's default
+    silently overwrites the main parser's value. So `--dry-run create` would
+    parse but produce `dry_run=False`. To dodge this we shift any flags that
+    appear before the subcommand to after it, so they're always parsed by the
+    subparser instance that wins.
+    """
+    sub_idx = None
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        # `--flag=value` is one element; no separate value to skip.
+        if arg.startswith("--") and "=" in arg:
+            continue
+        if arg in KNOWN_SUBCOMMANDS:
+            sub_idx = i
+            break
+        if arg in VALUE_FLAGS:
+            skip_next = True
+    if sub_idx is None or sub_idx == 0:
+        return argv
+    return [argv[sub_idx]] + argv[:sub_idx] + argv[sub_idx + 1:]
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Common flags live on a parent parser so they work whether passed BEFORE
     # the subcommand (`cmd --dry-run run`) or AFTER it (`cmd run --dry-run`).
+    # Argv is reordered upstream so flags always parse on the subparser side.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--env-file", default=DEFAULT_ENV_FILE,
                         help=f"Path to .env file with secrets (default: {DEFAULT_ENV_FILE})")
@@ -1245,7 +1477,8 @@ def cmd_integrations(firefly: FireflyClient) -> int:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    args = build_parser().parse_args(_reorder_argv_for_subcommand(raw))
     setup_logging(0 if args.quiet else args.verbose)
 
     env_path = Path(args.env_file)
@@ -1300,7 +1533,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
             results = orch.create_all(mapping, yes=args.yes)
             _print_summary(results)
-            return EXIT_OK if results.total_workflows_failed == 0 else EXIT_PARTIAL
+            had_failures = (
+                results.total_workflows_failed > 0
+                or results.total_projects_failed > 0
+                or results.total_repos_skipped > 0
+            )
+            return EXIT_PARTIAL if had_failures else EXIT_OK
 
         if args.command == "run":
             mapping = orch.build_mapping(ignore_missing_repos=args.ignore_missing_repos)
@@ -1310,7 +1548,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             log.warning("Wrote mapping to %s", mapping_path)
             results = orch.create_all(mapping, yes=args.yes)
             _print_summary(results)
-            return EXIT_OK if results.total_workflows_failed == 0 else EXIT_PARTIAL
+            had_failures = (
+                results.total_workflows_failed > 0
+                or results.total_projects_failed > 0
+                or results.total_repos_skipped > 0
+            )
+            return EXIT_PARTIAL if had_failures else EXIT_OK
 
     except ConfigError as e:
         log.error("%s", e)
@@ -1329,11 +1572,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
 
 def _print_summary(results: Results) -> None:
-    log.warning("Summary: repos=%d  workspaces created=%d  failed=%d  projects created=%d",
-                results.total_repos,
-                results.total_workflows_created,
-                results.total_workflows_failed,
-                results.total_projects_created)
+    log.warning(
+        "Summary: repos=%d skipped=%d  workspaces created=%d skipped=%d failed=%d  "
+        "projects created=%d failed=%d",
+        results.total_repos,
+        results.total_repos_skipped,
+        results.total_workflows_created,
+        results.total_workflows_skipped,
+        results.total_workflows_failed,
+        results.total_projects_created,
+        results.total_projects_failed,
+    )
 
 
 if __name__ == "__main__":
