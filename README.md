@@ -214,7 +214,7 @@ and `projects.path_variables`):
 | `create` | `false` | Whether to create Firefly project(s). When `false`, no projects are created (workspaces are unscoped). |
 | `nested` | `false` | Only meaningful when `create=true`. When `true`, mirrors the entire directory tree as a project hierarchy (one project per directory level). When `false`, only one main project per repo is created and all of that repo's workspaces are attached to it. |
 | `project_id` | `null` | When `create=false`, attach all workspaces to this single project ID. |
-| `main_members` | `[]` | Members for the per-repo main project (each `{userId, role}`) |
+| `main_members` | `[]` | Members for the per-repo main project (each `{userId, role}`). **Required (non-empty) when `create=true`** — without explicit members, a project may be created with no visible owner and become invisible in the Firefly UI. |
 | `main_variables` | `[]` | Variables for the per-repo main project |
 | `path_members` | `{}` | Map of `/path/in/repo` → list of members. Requires `nested=true` (otherwise sub-projects don't exist to attach to; the importer logs a warning at startup). |
 | `path_variables` | `{}` | Map of `/path/in/repo` → list of variables. Requires `nested=true`. |

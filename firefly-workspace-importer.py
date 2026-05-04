@@ -292,6 +292,16 @@ def validate_config(cfg: Config) -> None:
     for path, members_list in cfg.projects.path_members.items():
         errors.extend(_validate_members(f"projects.path_members[{path!r}]", members_list))
 
+    if cfg.projects.create and not cfg.projects.main_members:
+        errors.append(
+            "config.projects.create=true requires at least one entry in "
+            "config.projects.main_members. Without explicit members, a project "
+            "may be created with no visible owner — invisible in the Firefly UI "
+            "to anyone except the API key's user — and effectively become a "
+            "'zombie'. Add at least one member with role 'admin' to ensure the "
+            "project is reachable."
+        )
+
     if errors:
         raise ConfigError("Configuration errors:\n  - " + "\n  - ".join(errors))
 
